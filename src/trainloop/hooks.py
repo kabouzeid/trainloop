@@ -343,7 +343,7 @@ class CheckpointingHook(BaseHook):
         interval: int,
         keep_previous: int = 0,  # keep N previous checkpoints
         keep_interval: int = 0,  # keep checkpoints of every N-th step
-        path: Path | str = "checkpoint",
+        path: Path | str = "checkpoints",
         load: Path | str | Literal["latest"] | None = "latest",
         exit_signals: list[signal.Signals] | signal.Signals = None,
         exit_code: int | Literal["128+signal"] = "128+signal",
