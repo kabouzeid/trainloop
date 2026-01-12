@@ -30,6 +30,23 @@ from .trainer import BaseTrainer, Records
 from .utils import flatten_nested_dict, key_average
 
 
+def _dist_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _dist_world_size() -> int:
+    return dist.get_world_size() if _dist_is_initialized() else 1
+
+
+def _dist_rank() -> int:
+    return dist.get_rank() if _dist_is_initialized() else 0
+
+
+def _dist_barrier() -> None:
+    if _dist_is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()
+
+
 class BaseHook:
     """Lifecycle hooks for `BaseTrainer`."""
 
@@ -106,7 +123,7 @@ class _StatsHook(BaseHook):
             step_time = sum(self.step_times) / len(self.step_times)
             max_memory = max(self.max_memories) if self.max_memories else None
 
-            if self.sync:
+            if self.sync and _dist_world_size() > 1:
                 # aggregate accross all ranks
                 dist.all_reduce(loss, op=dist.ReduceOp.AVG)
                 if grad_norm is not None:
@@ -387,15 +404,19 @@ class CheckpointingHook(BaseHook):
     def on_before_step(self, trainer: BaseTrainer):
         if self.has_exit_signal_handlers:
             self.dist_exit_signal.fill_(self.local_exit_signal)
-            # micro optimization: reduce async during step and read after step
-            self.dist_exit_signal_work = dist.all_reduce(
-                self.dist_exit_signal, op=dist.ReduceOp.MAX, async_op=True
-            )
+            if _dist_world_size() > 1:
+                # micro optimization: reduce async during step and read after step
+                self.dist_exit_signal_work = dist.all_reduce(
+                    self.dist_exit_signal, op=dist.ReduceOp.MAX, async_op=True
+                )
+            else:
+                self.dist_exit_signal_work = None
 
     def on_after_step(self, trainer: BaseTrainer):
         save_and_exit = False
         if self.has_exit_signal_handlers:
-            self.dist_exit_signal_work.wait()
+            if self.dist_exit_signal_work is not None:
+                self.dist_exit_signal_work.wait()
             exit_signal = self.dist_exit_signal.item()
             save_and_exit = exit_signal != -1
 
@@ -414,7 +435,7 @@ class CheckpointingHook(BaseHook):
                 keep=self.keep_interval > 0 and trainer.step % self.keep_interval == 0,
             )
             if save_and_exit:
-                dist.barrier()
+                _dist_barrier()
                 if self.exit_wait > 0:
                     trainer.logger.info(
                         f"=> Waiting {self.exit_wait:.0f} seconds before exit ..."
@@ -435,7 +456,7 @@ class CheckpointingHook(BaseHook):
         while retaining or pruning older checkpoints are logged but not raised.
         """
 
-        dist.barrier()
+        _dist_barrier()
 
         state_dict = trainer.state_dict()
 
@@ -447,7 +468,7 @@ class CheckpointingHook(BaseHook):
         #     dst=0,
         # )
 
-        if dist.get_rank() == 0:
+        if _dist_rank() == 0:
             # make dir
             save_path = self.path / str(trainer.step)
             if not save_path.is_absolute():
@@ -606,7 +627,7 @@ class WandbHook(BaseHook):
         self.wandb_kwargs = wandb_kwargs
 
     def on_before_train(self, trainer: BaseTrainer):
-        if dist.get_rank() == 0:
+        if _dist_rank() == 0:
             wandb_run_id = self._load_wandb_run_id(trainer)
 
             tags = os.getenv("WANDB_TAGS", "")
@@ -627,11 +648,11 @@ class WandbHook(BaseHook):
                 self._save_wandb_run_id(trainer, self.wandb.id)
 
     def on_after_train(self, trainer: BaseTrainer):
-        if dist.get_rank() == 0:
+        if _dist_rank() == 0:
             self.wandb.finish()
 
     def on_log(self, trainer: BaseTrainer, records: dict, dry_run: bool = False):
-        if dist.get_rank() == 0:
+        if _dist_rank() == 0:
             data = {"/".join(k): v for k, v in flatten_nested_dict(records).items()}
             if not dry_run:
                 self.wandb.log(data, step=trainer.step)
@@ -639,7 +660,7 @@ class WandbHook(BaseHook):
                 trainer.logger.debug(f"Dry run log. Would log: {data}")
 
     def on_log_images(self, trainer: BaseTrainer, records: dict, dry_run: bool = False):
-        if dist.get_rank() == 0:
+        if _dist_rank() == 0:
             wandb_data = {}
             for k, img in flatten_nested_dict({"vis": records}).items():
                 file_type = self.image_format(k[-1])
@@ -705,7 +726,7 @@ class ImageFileLoggerHook(BaseHook):
             self.image_format = lambda _: image_format
 
     def on_log_images(self, trainer: BaseTrainer, records: dict, dry_run: bool = False):
-        if dist.get_rank() == 0:
+        if _dist_rank() == 0:
             for k, img in flatten_nested_dict(records).items():
                 p = trainer.workspace / "visualizations" / str(trainer.step) / Path(*k)
                 p = Path(str(p) + "." + self.image_format(k[-1]))
