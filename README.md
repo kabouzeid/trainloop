@@ -20,7 +20,7 @@ import logging
 import torch
 import torch.nn as nn
 
-from trainloop import BaseTrainer, ProgressHook
+from trainloop import BaseTrainer, CheckpointingHook, ProgressHook
 
 logging.basicConfig(level=logging.INFO)
 
@@ -49,6 +49,7 @@ class MyTrainer(BaseTrainer):
     def build_hooks(self):
         return [
             ProgressHook(interval=50, with_records=True),
+            CheckpointingHook(interval=500, keep_previous=2),
         ]
 
     def forward(self, batch):
